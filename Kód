@@ -1,103 +1,204 @@
-Provizorný kód!!!!
+/**
+ * ESP8266 ESP-01 hodiny a firmware pre počasie
+ *
+ * Tento firmware používa OLED displej SSD1306 128x64 na striedavé zobrazovanie:
+ * - Obrazovka hodín: deň v týždni, aktuálny čas (HH:MM), dátum
+ *
+ * Konfigurácia Wi-Fi:
+ * Ak nie je nájdená konfigurácia alebo je pri štarte podržané tlačidlo na GPIO3,
+ * zariadenie sa spustí ako Access Point (SSID: ESP01-Setup) a zobrazí
+ * konfiguračnú web stránku.
+ * Stránka umožňuje nastaviť Wi-Fi SSID, heslo, mesto pre počasie a časové pásmo.
+ * Nastavenia sa uložia do EEPROM a zariadenie sa reštartuje.
+ *
+ * Bežná prevádzka:
+ * Pripojí sa k Wi-Fi, synchronizuje čas cez NTP (každých 60 s).
+ * Získa počasie zo servera wttr.in (HTTPS GET).
+ * Zobrazuje čas a počasie na OLED, obrazovky sa prepínajú každých 15 sekúnd.
+ *
+ * Hardvér:
+ * - ESP8266 ESP-01 (GPIO0=SDA, GPIO2=SCL pre I2C OLED; GPIO3 ako vstup pre tlačidlo)
+ * - OLED displej SSD1306 128x64 cez I2C (adresa 0x3C)
+ *
+ * Poznámka: Používa vlastné fonty (FreeMonoBold18pt7b pre čas,
+ * FreeMonoBold12pt7b pre teplotu).
+ * Ostatný text používa predvolený font.
+ * Displej je otočený o 180 stupňov (setRotation(2)).
+ */
 
-#include <Wire.h> #include <BH1750.h> #include <Adafruit_CCS811.h> #include <DHT.h> #include <Adafruit_Sensor.h> #include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiClientSecure.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <Fonts/FreeMonoBold18pt7b.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <time.h>
 
-#define BLYNK_TEMPLATE_ID "TMPL4EAiYMHIv" #define BLYNK_TEMPLATE_NAME "SmartHome" #define BLYNK_AUTH_TOKEN "x8vjnPsDCfbX0pN542TtXNjzPBbmiL9k"
+// Definícia pinov (ESP-01):
+const uint8_t SDA_PIN = 0;           // I2C SDA pripojené na GPIO0
+const uint8_t SCL_PIN = 2;           // I2C SCL pripojené na GPIO2
+const uint8_t BUTTON_PIN = 3;        // Tlačidlo na GPIO3 (RX pin)
 
-// WiFi #include <WiFi.h> #include <BlynkSimpleEsp32.h>
+// Adresy v EEPROM pre konfiguračné údaje:
+const int EEPROM_SIZE = 512;
+const int ADDR_SSID = 0;
+const int ADDR_PASS = 70;
+const int ADDR_CITY = 140;
+const int ADDR_TZ   = 210;  // 4 bajty (int32) pre posun časového pásma v sekundách
+const int ADDR_SIGNATURE = 500;  // 4-bajtový podpis "CFG1" pre platnú konfiguráciu
 
-#define WIFI_SSID "Dano" #define WIFI_PASSWORD "heslo123"
+// Wi-Fi a web server:
+ESP8266WebServer server(80);
+const char *AP_SSID = "ESP01-Setup";  // SSID Access Pointu pre konfiguračný režim
 
-// Virtuálne piny #define VIRTUAL_PIN_TEMPERATURE V0 #define VIRTUAL_PIN_HUMIDITY V1 #define VIRTUAL_PIN_LUX V2 #define VIRTUAL_PIN_CO2 V3 #define VIRTUAL_PIN_TVOC V4
+// Displej:
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+bool displayInitialized = false;
 
-// --- DHT11 --- #define DHTPIN 4
-#define DHTTYPE DHT11 DHT dht(DHTPIN, DHTTYPE);
+// Čas a počasie:
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+unsigned long lastScreenSwitch = 0;
+bool showWeatherScreen = false;
+bool displayReady = false;
+unsigned long lastWeatherFetch = 0;
 
-// --- BH1750 a CCS811 --- BH1750 lightMeter; Adafruit_CCS811 ccs;
+// Konfiguračné premenné:
+String wifiSSID = "";
+String wifiPass = "";
+String city = "";
+int timezoneOffset = 0;  // v sekundách
 
-// --- RGB LED --- #define LED_R 25 #define LED_G 26 #define LED_B 27
+// Premenné pre údaje o počasí:
+String weatherTemp = "N/A";
+String weatherCond = "";
+String weatherHum = "";
+String weatherWind = "";
+String weatherPress = "";
+bool weatherValid = false;
 
-// --- LED Matica --- #define LED_MATRIX_PIN 13
-#define LED_COUNT 64 Adafruit_NeoPixel strip(LED_COUNT, LED_MATRIX_PIN, NEO_GRB + NEO_KHZ800);
+// Prototypy funkcií:
+void loadSettings();
+void saveSettings();
+void startConfigPortal();
+void handleConfigForm();
+void drawTimeScreen();
+void drawWeatherScreen();
+bool getWeather();
 
-// --- LED pre rekuperáciu --- #define LED_REKUP 33
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println(F("Booting..."));
 
-// --- Cieľové hodnoty --- #define TARGET_LUX 700 #define TARGET_CO2 2000 // ppm #define TARGET_TVOC 600 // ppb
-
-void setup() { Serial.begin(115200); delay(100);
-
-Wire.begin(21, 22); // I2C pre ESP32
-
-// WiFi pripojenie WiFi.begin(WIFI_SSID, WIFI_PASSWORD); while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); } Serial.println("\nWiFi pripojené!"); Serial.print("IP Adresa: "); Serial.println(WiFi.localIP());
-
-Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASSWORD);
-
-dht.begin();
-
-Serial.println("Inicializujem BH1750..."); if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23)) { Serial.println("BH1750 OK"); } else { Serial.println("CHYBA: BH1750 sa nepodarilo inicializovať!"); }
-
-Serial.println("Inicializujem CCS811..."); if (!ccs.begin()) { Serial.println("CHYBA: CCS811 sa nepodarilo nájsť!"); while (1); }
-
-while (!ccs.available()) { delay(100); } Serial.println("CCS811 OK");
-
-pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT);
-
-strip.begin(); strip.show();
-
-pinMode(LED_REKUP, OUTPUT); }
-
-void loop() { Blynk.run();
-
-float temp = dht.readTemperature(); float hum = dht.readHumidity();
-
-if (!isnan(temp) && !isnan(hum)) { Serial.print("Teplota: "); Serial.print(temp); Serial.println(" °C");
-
-Serial.print("Vlhkosť: ");
-Serial.print(hum);
-Serial.println(" %");
-} else { Serial.println("CHYBA: Nepodarilo sa prečítať z DHT11"); }
-
-float lux = lightMeter.readLightLevel(); if (lux >= 0) { Serial.print("Svetlo: "); Serial.print(lux); Serial.println(" lx");
-
-int brightness = 0;
-if (lux < TARGET_LUX) {
-  brightness = map(lux, 0, TARGET_LUX, 255, 0);
-} else {
-  brightness = map(lux, TARGET_LUX, 1000, 0, 255);
-}
-
-strip.fill(strip.Color(brightness, brightness, brightness));  
-strip.show();
-} else { Serial.println("CHYBA: Nepodarilo sa prečítať BH1750"); }
-
-int co2 = -1; int tvoc = -1;
-
-if (ccs.available()) { if (!ccs.readData()) { co2 = ccs.geteCO2(); tvoc = ccs.getTVOC();
-
-  Serial.print("eCO2: ");
-  Serial.print(co2);
-  Serial.print(" ppm, TVOC: ");
-  Serial.print(tvoc);
-  Serial.println(" ppb");
-
-  // Rekuperácia na základe cieľových hodnôt
-  if (co2 > TARGET_CO2 || tvoc > TARGET_TVOC) {
-    Serial.println("Zapínam rekuperáciu (LED)");
-    digitalWrite(LED_REKUP, HIGH);
+  // Inicializácia displeja
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    displayInitialized = true;
+    display.setRotation(2);
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.print("Booting...");
+    display.display();
+    displayReady = true;
   } else {
-    digitalWrite(LED_REKUP, LOW);
+    Serial.println(F("Zlyhala inicializácia SSD1306"));
   }
 
-} else {
-  Serial.println("CHYBA: Nepodarilo sa prečítať CCS811");
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Inicializácia EEPROM a načítanie nastavení
+  EEPROM.begin(EEPROM_SIZE);
+  bool configMode = false;
+
+  // Kontrola podpisu konfigurácie v EEPROM
+  if (EEPROM.read(ADDR_SIGNATURE) == 'C' &&
+      EEPROM.read(ADDR_SIGNATURE + 1) == 'F' &&
+      EEPROM.read(ADDR_SIGNATURE + 2) == 'G' &&
+      EEPROM.read(ADDR_SIGNATURE + 3) == '1') {
+    Serial.println(F("Podpis konfigurácie nájdený v EEPROM."));
+  } else {
+    Serial.println(F("Podpis konfigurácie nenájdený (EEPROM prázdna)."));
+  }
+
+  // Kontrola stlačenia tlačidla počas prvých 300 ms po štarte
+  bool buttonPressed = false;
+  unsigned long startTime = millis();
+  while (millis() - startTime < 300) {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      buttonPressed = true;
+    }
+    delay(10);
+  }
+
+  if (buttonPressed) {
+    Serial.println(F("Tlačidlo podržané – vstup do konfiguračného AP režimu."));
+  }
+
+  // Určenie, či sa má spustiť konfiguračný portál
+  if (EEPROM.read(ADDR_SIGNATURE) != 'C' ||
+      EEPROM.read(ADDR_SIGNATURE + 1) != 'F' ||
+      EEPROM.read(ADDR_SIGNATURE + 2) != 'G' ||
+      EEPROM.read(ADDR_SIGNATURE + 3) != '1' ||
+      buttonPressed) {
+    configMode = true;
+  }
+
+  if (configMode) {
+    // Načítanie existujúcich nastavení (ak existujú)
+    if (EEPROM.read(ADDR_SIGNATURE) == 'C' &&
+        EEPROM.read(ADDR_SIGNATURE + 1) == 'F' &&
+        EEPROM.read(ADDR_SIGNATURE + 2) == 'G' &&
+        EEPROM.read(ADDR_SIGNATURE + 3) == '1') {
+      loadSettings();
+    }
+    // Spustenie konfiguračného portálu (AP režim)
+    startConfigPortal();
+  } else {
+    // Načítanie nastavení z EEPROM
+    loadSettings();
+    Serial.print(F("Pripájam sa k WiFi: "));
+    Serial.println(wifiSSID);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+
+    // Čakanie max. 10 sekúnd na pripojenie
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+      delay(500);
+      Serial.print('.');
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println(F("WiFi pripojené."));
+      Serial.print(F("IP adresa: "));
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println(F("WiFi zlyhalo, spúšťam AP režim."));
+      startConfigPortal();
+      return;
+    }
+
+    // Nastavenie NTP klienta s uloženým časovým pásmom
+    timeClient.setPoolServerName("pool.ntp.org");
+    timeClient.setTimeOffset(timezoneOffset);
+    timeClient.setUpdateInterval(900000);
+    timeClient.begin();
+    timeClient.update();
+
+    // Prvá aktualizácia počasia
+    lastWeatherFetch = 0;
+    weatherValid = false;
+    Serial.println(F("Setup dokončený."));
+  }
+
+  Serial.println(F("Získavam počiatočné počasie..."));
+  weatherValid = getWeather();
+  lastWeatherFetch = millis();
 }
-}
-
-// Farebná signalizácia kvality vzduchu if (co2 > TARGET_CO2 || tvoc > TARGET_TVOC) { Serial.println("Kvalita vzduchu zlá, LED na červeno"); digitalWrite(LED_R, LOW);
-digitalWrite(LED_G, HIGH); digitalWrite(LED_B, HIGH); } else if (temp < 18 || temp > 26 || hum < 30 || hum > 60) { Serial.println("Teplota alebo vlhkosť zlá, LED na žlto"); digitalWrite(LED_R, LOW);
-digitalWrite(LED_G, LOW); digitalWrite(LED_B, HIGH); } else { Serial.println("Všetko v poriadku, LED na zeleno"); digitalWrite(LED_R, HIGH);
-digitalWrite(LED_G, LOW); digitalWrite(LED_B, HIGH); }
-
-// Odoslanie do Blynk Blynk.virtualWrite(VIRTUAL_PIN_TEMPERATURE, temp); Blynk.virtualWrite(VIRTUAL_PIN_HUMIDITY, hum); Blynk.virtualWrite(VIRTUAL_PIN_LUX, lux); Blynk.virtualWrite(VIRTUAL_PIN_CO2, co2); Blynk.virtualWrite(VIRTUAL_PIN_TVOC, tvoc);
-
-Serial.println("-----------------------------"); delay(2000); }
