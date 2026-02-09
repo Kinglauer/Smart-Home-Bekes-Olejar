@@ -46,3 +46,5 @@ Užívatelia môžu cez aplikáciu sledovať teplotu, vlhkosť, svetlo a kvalitu
 Dom automaticky reaguje na zmeny – napr. stlmí alebo zosilní svetlo, zapne „rekuperáciu“
 
 Projekt môže slúžiť ako základ pre rozšírené smart home systémy (napr. ovládanie žalúzií, kúrenia, ventilácie či bezpečnostných funkcií)
+<img width="1410" height="2250" alt="plagat iot" src="https://github.com/user-attachments/assets/6d2f8773-e8e8-4e20-a67c-dfea6a241b5b" />
+
